@@ -81,6 +81,27 @@ def main(argv=None):
             args,
         )
 
+    elif args.script == "curriculum_learning":
+        # the curricullum_learning module should list out the task
+        # for now just hard code
+        # in the while loop in train.py we go through each task for
+        # fixed amount of time step and then load new env and load
+        # the current checkpoint
+        eval_config = config
+        if "humanoid" in config.task:
+            # {"env.humanoid.is_eval": True} enables us to visualize evaluation in img space
+            eval_config = eval_config.update({"env.humanoid.is_eval": True})
+        embodied.run.curriculum_learning(
+            bind(make_agent, config),
+            bind(make_replay, config, "replay"),
+            bind(make_replay, config, "eval_replay", is_eval=True),
+            make_env,
+            make_env,
+            bind(make_logger, config),
+            args,
+            config,
+            eval_config,
+        )
     elif args.script == "train_holdout":
         assert config.eval_dir
         embodied.run.train_holdout(
@@ -115,14 +136,16 @@ def main(argv=None):
             envid = int(os.environ["JOB_COMPLETION_INDEX"])
         embodied.run.parallel_env(bind(make_env, config), envid, args)
 
+
     else:
         raise NotImplementedError(args.script)
 
 
 def make_agent(config):
     from . import agent as agt
-
-    env = make_env(config, 0)
+    # make_agent uses the env only to inform the agent's obs and action space
+    # doesn't change for diferent tasks within the same suite
+    env = make_env(config, 0)  # 0 is the random seed
     agent = agt.Agent(env.obs_space, env.act_space, config)
     env.close()
     return agent
@@ -162,7 +185,7 @@ def make_replay(config, directory=None, is_eval=False, rate_limit=False):
 def make_env(config, index, **overrides):
     from embodied.envs import from_gym
 
-    suite, task = config.task.split("_", 1)
+    suite, task = config.task.split("_", 1) # 1 ==> split into 2 strings
     if suite == "procgen":
         import procgen  # noqa
     ctor = {
@@ -186,12 +209,15 @@ def make_env(config, index, **overrides):
     if isinstance(ctor, str):
         module, cls = ctor.split(":")
         module = importlib.import_module(module)
-        ctor = getattr(module, cls)
+        ctor = getattr(module, cls)  # ctor is the FromGymnasium class
     kwargs = config.env.get(suite, {})
     kwargs.update(overrides)
     if kwargs.get("use_seed", False):
         kwargs["seed"] = hash((config.seed, index))
-    env = ctor(task, **kwargs)
+    # this is where the task environments are being created
+    # better to call make env for different task list
+    # make env uses config; i suppose i could ovverride config.task
+    env = ctor(task, **kwargs)  # WE CAN FIND IMAGE KEY HERE
     return wrap_env(env, config)
 
 

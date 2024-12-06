@@ -17,14 +17,6 @@ _CRAWL_HEIGHT = 0.8
 _WALK_SPEED = 1
 _RUN_SPEED = 5
 
-# NOTE: I AM ADDING ONE HOT ENCODED TASK LABEL FOR EACH TASK
-_TASK_LABELS = {
-    "stand": [1, 0, 0, 0],
-    "walk":  [0, 1, 0, 0],
-    "run":   [0, 0, 1, 0],
-    "maze":  [0, 0, 0, 1],
-}
-_NUM_TASKS = 4 #later automate one hot encoding generation
 
 class Walk(Task):
     qpos0_robot = {
@@ -50,14 +42,8 @@ class Walk(Task):
         # TODO: INCREASE THE OBS SPACE TO ADD TASK LABEL
         # TODO: OVERLOAD THE get_obs() from TASK
         return Box(
-            low=-np.inf, high=np.inf, shape=(self.robot.dof * 2 - 1 + _NUM_TASKS,), dtype=np.float64
+            low=-np.inf, high=np.inf, shape=(self.robot.dof * 2 - 1,), dtype=np.float64
         )
-    
-    def get_obs(self):
-        position = self._env.data.qpos.flat.copy()
-        velocity = self._env.data.qvel.flat.copy()
-        state = np.concatenate((position, velocity, np.asarray(_TASK_LABELS["walk"])))  # NOTE: ADDING TASK LABEL
-        return state
 
     def get_reward(self):
         standing = rewards.tolerance(
@@ -117,21 +103,9 @@ class Stand(Walk):
     _move_speed = 0
     success_bar = 800
 
-    def get_obs(self):
-        position = self._env.data.qpos.flat.copy()
-        velocity = self._env.data.qvel.flat.copy()
-        state = np.concatenate((position, velocity, np.asarray(_TASK_LABELS["stand"])))  # NOTE: ADDING TASK LABEL
-        return state
-
 
 class Run(Walk):
     _move_speed = _RUN_SPEED
-
-    def get_obs(self):
-        position = self._env.data.qpos.flat.copy()
-        velocity = self._env.data.qvel.flat.copy()
-        state = np.concatenate((position, velocity, np.asarray(_TASK_LABELS["run"])))  # NOTE: ADDING TASK LABEL
-        return state
 
 
 class Crawl(Walk):

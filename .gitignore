@@ -15,3 +15,6 @@ models
 outputs
 runs
 wandb
+jaxrl_m/checkpoint_pre.ckpt
+logs/*
+humanoid_bench/assets

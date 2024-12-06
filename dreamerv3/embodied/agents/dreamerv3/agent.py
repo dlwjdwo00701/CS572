@@ -44,6 +44,7 @@ class Agent(nj.Module):
         }
         self.act_space = {k: v for k, v in act_space.items() if k != "reset"}
         self.config = config
+        # TODO: maybe add task label in wm?
         self.wm = WorldModel(self.obs_space, self.act_space, config, name="wm")
         self.task_behavior = getattr(behaviors, config.task_behavior)(
             self.wm, self.act_space, self.config, name="task_behavior"
@@ -141,6 +142,8 @@ class WorldModel(nj.Module):
         self.obs_space = obs_space
         self.act_space = act_space
         self.config = config
+        # TODO: maybe updating the observation space of the task env
+        # to take also output one hot task label? we hardcode the number of task.
         self.encoder = nets.MultiEncoder(obs_space, **config.encoder, name="enc")
         if config.rssm_type == "rssm":
             self.rssm = nets.RSSM(**config.rssm, name="rssm")

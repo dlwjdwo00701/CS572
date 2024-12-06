@@ -109,6 +109,7 @@ class HumanoidEnv(MujocoEnv, gym.utils.EzPickle):
         control=None,
         task=None,
         render_mode="rgb_array",
+        # render_mode="human",
         width=256,
         height=256,
         randomness=DEFAULT_RANDOMNESS,

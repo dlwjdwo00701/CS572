@@ -53,6 +53,8 @@ class Driver:
         step, episode = 0, 0
         while step < steps or episode < episodes:
             step, episode = self._step(policy, step, episode)
+            # print("step: ", step)
+            # print("episode: ", episode)
 
     def _step(self, policy, step, episode):
         assert all(len(x) == self.length for x in self.acts.values())

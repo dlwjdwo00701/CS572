@@ -10,14 +10,6 @@ _STAND_HEIGHT = 1.65
 
 _MOVE_SPEED = 2.0
 
-# NOTE: I AM ADDING ONE HOT ENCODED TASK LABEL FOR EACH TASK
-_TASK_LABELS = {
-    "stand": [1, 0, 0, 0],
-    "walk":  [0, 1, 0, 0],
-    "run":   [0, 0, 1, 0],
-    "maze":  [0, 0, 0, 1],
-}
-_NUM_TASKS = 4 #later automate one hot encoding generation
 
 class MazeBase(Task):
     camera_name = "cam_maze"
@@ -49,15 +41,9 @@ class MazeBase(Task):
     @property
     def observation_space(self):
         return Box(
-            low=-np.inf, high=np.inf, shape=(self.robot.dof * 2 - 1 + _NUM_TASKS,), dtype=np.float64
+            low=-np.inf, high=np.inf, shape=(self.robot.dof * 2 - 1,), dtype=np.float64
         )
-    
-    def get_obs(self):
-        position = self._env.data.qpos.flat.copy()
-        velocity = self._env.data.qvel.flat.copy()
-        state = np.concatenate((position, velocity, np.asarray(_TASK_LABELS["maze"])))  # NOTE: ADDING TASK LABEL
-        return state
-    
+
     def update_move_direction(self):
         self.move_direction = np.array([1, 0, 0])
         self.maze_stage = 0

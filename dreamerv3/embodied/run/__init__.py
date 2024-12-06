@@ -4,3 +4,4 @@ from .parallel import parallel_env
 from .train import train
 from .train_eval import train_eval
 from .train_holdout import train_holdout
+from .curriculum_learning import curriculum_learning

@@ -4,7 +4,7 @@ defaults:
   method: name
   task: dummy_disc
   logdir: /dev/null
-  replay_size: 1e6
+  replay_size: 1e6  # TODO: og 1e6
   eval_dir: ''
   filter: '.*'
   tensorboard_videos: True
@@ -14,7 +14,8 @@ defaults:
     jit: True
     compute_dtype: float16
     param_dtype: float32
-    prealloc: True
+    # prealloc: True
+    prealloc: False
     checks: False
     logical_cpus: 0
     debug: False
@@ -28,13 +29,14 @@ defaults:
 
   run:
     script: train
+    # steps: 1e10
     steps: 1e10
     duration: 0
-    num_envs: 4
+    num_envs: 2
     expl_until: 0
     log_every: 120
     save_every: 900
-    eval_every: 1e6
+    eval_every: 1e3
     eval_initial: True
     eval_eps: 1
     eval_samples: 1
@@ -74,6 +76,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False}
     dmc: {size: [64, 64], repeat: 2, camera: -1}
     loconav: {size: [64, 64], repeat: 2, camera: -1}
+    # does changhing this obs_key to image change the obs space???
     humanoid: {obs_key: vector, policy_path: "", mean_path: "", var_path: "", policy_type: "", small_obs: "", is_eval: False, actuation: position, reward_dict: {hand_dist: 0.1, target_dist: 0.1, success: 10, terminate: False}}
 
   # Agent
@@ -257,12 +260,29 @@ humanoid_proprio:
   encoder: {mlp_keys: '.*', cnn_keys: '$^'}
   decoder: {mlp_keys: '.*', cnn_keys: '$^'}
 
+humanoid_vision_debug:
+  task: humanoid_Pushing-v0
+  run: {num_envs: 2, eval_every: 1000, log_every: 5, save_every: 15, train_ratio: 8, actor_batch: 2, driver_parallel: False}
+
+  # run:
+  #   log_every: 30  # Seconds
+  #   eval_every: 500000  # Steps
+  #   train_ratio: 512
+  rssm.deter: 64
+  .*\.cnn_depth: 2
+  .*\.layers: 2
+  .*\.units: 128
+  encoder: {mlp_keys: '.*', cnn_keys: 'image'}
+  decoder: {mlp_keys: '.*', cnn_keys: 'image'}
+
 humanoid_vision:
   task: humanoid_Pushing-v0
-  run:
-    log_every: 30  # Seconds
-    eval_every: 500000  # Steps
-    train_ratio: 512
+  run: {num_envs: 2, eval_every: 1000, log_every: 5, save_every: 15, train_ratio: 8, actor_batch: 2, driver_parallel: False}
+
+  # run:
+  #   log_every: 30  # Seconds
+  #   eval_every: 500000  # Steps
+  #   train_ratio: 512
   rssm.deter: 512
   .*\.cnn_depth: 32
   .*\.layers: 2
@@ -283,6 +303,23 @@ humanoid_benchmark:
     train_ratio: 64
     log_every: 30 # Seconds
   batch_size: 16
+  # encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  # decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  encoder: {mlp_keys: '.*', cnn_keys: 'image'}
+  decoder: {mlp_keys: '.*', cnn_keys: 'image'}
+humanoid_benchmark_small:
+  task: humanoid_Pushing-v0
+  rssm.deter: 64
+  rssm.bottleneck: -1
+  .*\.cnn_depth: 4
+  .*\.units: 64
+  .*\.layers: 1
+  run:
+    script: train_eval
+    eval_every: 50  # Steps
+    train_ratio: 6
+    log_every: 30 # Seconds
+  batch_size: 1
   encoder: {mlp_keys: '.*', cnn_keys: '$^'}
   decoder: {mlp_keys: '.*', cnn_keys: '$^'}
 
