@@ -40,39 +40,39 @@ def curriculum_learning(
     should_save = embodied.when.Clock(args.save_every)
     should_eval = embodied.when.Every(args.eval_every, args.eval_initial)
 
-    # Define your tasks
+    # DUMMY TASKS FOR DEBUGGING
     tasks = [
         {'name': 'humanoid_h1hand-stand-v0', 'difficulty': 1, 'reward_threshold': 800},
         {'name': 'humanoid_h1hand-walk-v0', 'difficulty': 2, 'reward_threshold': 1000},
-        {'name': 'humanoid_h1hand-maze-v0', 'difficulty': 3, 'reward_threshold': 1500},
-        {'name': 'humanoid_h1hand-run-v0', 'difficulty': 4, 'reward_threshold': 2000},
-
-        # Add more tasks as needed
+        {'name': 'humanoid_h1hand-run-v0', 'difficulty': 3, 'reward_threshold': 1500},
+        {'name': 'humanoid_h1hand-maze-v0', 'difficulty': 4, 'reward_threshold': 2000},
+        # {'name': 'humanoid_h1hand-sit_simple-v0', 'difficulty': 2, 'reward_threshold': 1000}, # does it load the chair??
+        # {'name': 'humanoid_h1hand-slide-v0', 'difficulty': 3, 'reward_threshold': 1500},
+        # {'name': 'humanoid_h1hand-stair-v0', 'difficulty': 3, 'reward_threshold': 1500},
+        # {'name': 'humanoid_h1hand-hurdle-v0', 'difficulty': 3, 'reward_threshold': 1500},
+        # {'name': 'humanoid_h1hand-sit_hard-v0', 'difficulty': 4, 'reward_threshold': 2000}, # diff obs space
+        # {'name': 'humanoid_h1hand-balance_simple-v0', 'difficulty': 2, 'reward_threshold': 1000}, # diff obs space
+        # {'name': 'humanoid_h1hand-balance_hard-v0', 'difficulty': 4, 'reward_threshold': 2000}, # diff obs space
+        # {'name': 'humanoid_h1strong-highbar_simple-v0', 'difficulty': 5, 'reward_threshold': 2500}, # doesnt exist??
+        # {'name': 'humanoid_h1strong-highbar_hard-v0', 'difficulty': 5, 'reward_threshold': 2500},# doesnt exist??
     ]
+    # TODO: ADD WANDB LOG FOR TASK SWITCHING
+    # TODO: ADD VICTORIN"S EVALUATION METRIC
     num_tasks = len(tasks)
 
     for task_info in tasks:
         task_name = task_info['name']
-        task_difficulty = task_info['difficulty']
-        score_threshold = task_info['reward_threshold']
-        recent_scores = []
-
-        # Log the start of a new task
-        logger.add({
-            "task_name": task_name,
-            "task_difficulty": task_difficulty,
-            "event": "task_started",
-            "timestamp": step
-        }, prefix="task")
-
-        # Update task configurations
         task_config = copy.deepcopy(config)
         task_config = task_config.update({'task': task_name})
 
         task_eval_config = copy.deepcopy(eval_config)
         task_eval_config = task_eval_config.update({'task': task_name})
+        
+        score_threshold = task_info['reward_threshold']
+        task_difficulty = task_info['difficulty']
+        recent_scores = []
 
-        # Initialize drivers
+        
         fns = [bind(make_train_env, task_config, i) for i in range(args.num_envs)]
         train_driver = embodied.Driver(fns, args.driver_parallel)
         train_driver.on_step(lambda tran, _: step.increment())
@@ -82,7 +82,7 @@ def curriculum_learning(
         eval_driver = embodied.Driver(fns_eval, args.driver_parallel)
         eval_driver.on_step(eval_replay.add)
 
-        # Define logging step
+        # TODO: UPDATE LOGGER SO THAT I CAN ALSO VISUALIZE EACH TASK REWARD SEPERATELY
         @embodied.timer.section("log_step")
         def log_step(tran, worker, mode):
             nonlocal recent_scores
@@ -124,7 +124,7 @@ def curriculum_learning(
                         "score": score,
                         "length": length,
                         "task_name": task_name,  # Include task name
-                        "task_difficulty": task_difficulty,
+                        "task_number": task_difficulty,
                     },
                     prefix="episode",
                 )
@@ -132,8 +132,8 @@ def curriculum_learning(
                     {
                         "return": score,
                         "episode_length": length,
-                        "task_name": task_name,
-                        "task_difficulty": task_difficulty,
+                        "task_name": task_name,  # Include task name
+                        "task_number": task_difficulty,
                     },
                     prefix="results",
                 )
@@ -157,7 +157,6 @@ def curriculum_learning(
         train_driver.on_step(bind(log_step, mode="train"))
         eval_driver.on_step(bind(log_step, mode="eval"))
 
-        # Prepare datasets
         train_dataset = agent.dataset(
             embodied.Batch([train_replay.dataset] * args.batch_size)
         )
@@ -177,7 +176,6 @@ def curriculum_learning(
 
         train_driver.on_step(train_step)
 
-        # Setup checkpoint
         checkpoint = embodied.Checkpoint(logdir / "checkpoint.ckpt")
         checkpoint.step = step
         checkpoint.agent = agent
@@ -187,10 +185,11 @@ def curriculum_learning(
 
         if args.from_checkpoint:
             checkpoint.load(args.from_checkpoint)
-        checkpoint.load_or_save()
+        else:
+            checkpoint.save()
+        # checkpoint.load_or_save()
         should_save(step)  # Register that we just saved.
 
-        # Define policies
         train_policy = lambda *args: agent.policy(
             *args, mode="explore" if should_expl(step) else "train"
         )
@@ -200,7 +199,7 @@ def curriculum_learning(
         def task_completion_criteria(steps_taken, num_tasks):
             completed = steps_taken >= int(args.steps / num_tasks)
             if completed is True:
-                print("TASK COMPLETED")
+                print("TASK COMPLETEED")
             return completed
 
         print(f"Start training loop on {task_name}")
@@ -208,6 +207,14 @@ def curriculum_learning(
         # Initialize the starting step for the current task
         task_start_step = step.save()
         steps_taken = 0
+
+        # Log the start of a new task
+        logger.add({
+            "task_name": task_name,
+            "task_number": task_difficulty,
+            "event": "task_started",
+            "timestamp": task_start_step
+        }, prefix="task")
 
         while not task_completion_criteria(steps_taken, num_tasks):
             print("STEPS: ", step)
@@ -238,16 +245,18 @@ def curriculum_learning(
             steps_taken = step.save() - task_start_step
 
             # Check if the task's reward threshold is met
-            if len(recent_scores) >= 10 and np.mean(recent_scores[-10:]) >= score_threshold:
-                print(f"Task {task_name} completed with average score {np.mean(recent_scores[-10:])}")
-                logger.add({
-                    "task_name": task_name,
-                    "average_score": np.mean(recent_scores[-10:]),
-                    "reward_threshold": score_threshold,
-                    "event": "task_completed",
-                    "timestamp": step
-                }, prefix="task")
-                break  # Move to the next task
+            # if len(recent_scores) >= 10 and np.mean(recent_scores[-10:]) >= score_threshold:
+            # if len(recent_scores) >= 10:
+            #     print(f"Task {task_name} completed with average score {np.mean(recent_scores[-10:])}")
+            #     logger.add({
+            #         "task_name": task_name,
+            #         "average_score": np.mean(recent_scores[-10:]),
+            #         "reward_threshold": score_threshold,
+            #         "event": "task_completed",
+            #         "timestamp": step
+            #     }, prefix="task")
+            #     break  # Move to the next task
+
 
         print(f"Completed training on {task_name} task")
         checkpoint.save()
