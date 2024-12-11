@@ -187,7 +187,7 @@ def curriculum_learning(
 
     def task_completed(eval_returns, threshold, task_id):
         # Simple criterion: if average of last 10 evaluation returns exceeds threshold
-        if len(eval_returns) < 10:
+        if len(eval_returns) < 2:
             return False
         mean_return = np.mean(eval_returns[-10:])
         done = mean_return >= threshold
@@ -200,6 +200,19 @@ def curriculum_learning(
             "done": done,
         }, prefix="eval_metrics")
         return done
+    
+    checkpoint = embodied.Checkpoint(logdir / "checkpoint.ckpt")
+    checkpoint.step = step
+    checkpoint.agent = agent
+
+    checkpoint.train_replay = train_replay
+    checkpoint.eval_replay = eval_replay
+
+    if args.from_checkpoint:
+        checkpoint.load(args.from_checkpoint)
+    else:
+        checkpoint.save()
+    should_save(step)  # Register that we just saved.
     
     for task_info in tasks:
         task_name = task_info['name']
@@ -219,7 +232,9 @@ def curriculum_learning(
         train_driver.on_step(lambda tran, _: step.increment())
         train_driver.on_step(train_replay.add)
 
-        fns_eval = [bind(make_eval_env, task_eval_config, i) for i in range(args.num_envs)]
+        # fns_eval = [bind(make_eval_env, task_eval_config, i) for i in range(args.num_envs)]
+        # I DONT THINK WE NEED MORE THAN 1 ENV FOR EVALUATION
+        fns_eval = [bind(make_eval_env, task_eval_config, i) for i in range(1)]
         eval_driver = embodied.Driver(fns_eval, args.driver_parallel)
         eval_driver.on_step(eval_replay.add)
 
@@ -245,18 +260,18 @@ def curriculum_learning(
 
         train_driver.on_step(train_step)
         
-        checkpoint = embodied.Checkpoint(logdir / "checkpoint.ckpt")
-        checkpoint.step = step
-        checkpoint.agent = agent
+        # checkpoint = embodied.Checkpoint(logdir / "checkpoint.ckpt")
+        # checkpoint.step = step
+        # checkpoint.agent = agent
 
-        checkpoint.train_replay = train_replay
-        checkpoint.eval_replay = eval_replay
+        # checkpoint.train_replay = train_replay
+        # checkpoint.eval_replay = eval_replay
 
-        if args.from_checkpoint:
-            checkpoint.load(args.from_checkpoint)
-        else:
-            checkpoint.save()
-        should_save(step)  # Register that we just saved.
+        # if args.from_checkpoint:
+        #     checkpoint.load(args.from_checkpoint)
+        # else:
+        #     checkpoint.save()
+        # should_save(step)  # Register that we just saved.
 
         train_policy = lambda *args: agent.policy(
             *args, mode="explore" if should_expl(step) else "train"
@@ -280,6 +295,9 @@ def curriculum_learning(
 
         while not task_solved:
             print("STEPS: ", step)
+            # print("TRAIN REPLAY: ", train_replay.stats())
+            # print("EVAL REPLAY: ", eval_replay.stats())
+
             if should_eval(step):
                 print("Start evaluation")
                 eval_driver.reset(agent.init_policy)
@@ -328,6 +346,13 @@ def curriculum_learning(
 
         print(f"Completed training on {task_name} task")
         checkpoint.save()
+        # Close environments and drivers
+        train_driver.close()
+        eval_driver.close()
 
     print("\nCurriculum learning finished")
     logger.close()
+    train_driver.close()
+    eval_driver.close()
+    # train_replay.close()
+    # eval_replay.close()

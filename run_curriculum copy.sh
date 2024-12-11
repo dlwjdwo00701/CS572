@@ -5,15 +5,16 @@
 python -m embodied.agents.dreamerv3.train \
   --configs humanoid_benchmark \
   --run.wandb True \
+  --run.num_envs 1 \
   --run.script curriculum_learning \
-  --run.eval_every 25000 \
+  --run.eval_every 5000 \
   --run.wandb_entity adeeb-islam8 \
   --method dreamer \
   --logdir logs \
   --task humanoid_h1hand-stand-v0 \
   --seed 0 \
-  --run.from_checkpoint "/home/ave/CS572/logs/checkpoint.ckpt" \
-  --replay_size 5e5 \
-  # --run.num_envs 1 \
-  # --run.wandb_resume: auto \
-  
+  --batch_size 4 \
+  --replay_size 1e6 \
+  --run.steps 1e6 \
+  --run.from_checkpoint "" \
+  --run.wandb_resume: auto \

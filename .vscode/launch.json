@@ -1,0 +1,35 @@
+{
+    // IntelliSense를 사용하여 가능한 특성에 대해 알아보세요.
+    // 기존 특성에 대한 설명을 보려면 가리킵니다.
+    // 자세한 내용을 보려면 https://go.microsoft.com/fwlink/?linkid=830387을(를) 방문하세요.
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Debug DreamerV3 Training",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "embodied.agents.dreamerv3.train",
+            "args": [
+                "--configs", "humanoid_benchmark",
+                "--run.wandb", "True",
+                "--run.script", "curriculum_learning",
+                "--run.eval_every", "250",
+                "--run.wandb_entity", "adeeb-islam8",
+                "--method", "dreamer",
+                "--logdir", "logs",
+                "--task", "humanoid_h1hand-stand-v0",
+                "--seed", "0",
+                "--run.from_checkpoint", "/home/ave/CS572/logs/checkpoint.ckpt",
+                "--replay_size", "5e5"
+                // Add any additional flags here
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}" // Adjust as needed if dependencies are not in workspace
+            },
+            "justMyCode": false
+        }
+    ]
+}

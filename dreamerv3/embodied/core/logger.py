@@ -321,6 +321,11 @@ class WandBOutput:
             entity=config.run.wandb_entity,
             config=config and dict(config),
             dir=wandb_logdir,
+            # resume=config.run.wandb_resume,
+            resume="must",
+            id="1p0ta535"
+            # id=config.run.wandb_resume_id,
+
         )
         self._wandb = wandb
         self._name = name
