@@ -322,8 +322,8 @@ class WandBOutput:
             config=config and dict(config),
             dir=wandb_logdir,
             # resume=config.run.wandb_resume,
-            resume="must",
-            id="1p0ta535"
+            # resume="must",
+            # id="1p0ta535"
             # id=config.run.wandb_resume_id,
 
         )

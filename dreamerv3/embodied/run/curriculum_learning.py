@@ -187,7 +187,7 @@ def curriculum_learning(
 
     def task_completed(eval_returns, threshold, task_id):
         # Simple criterion: if average of last 10 evaluation returns exceeds threshold
-        if len(eval_returns) < 2:
+        if len(eval_returns) < 5:
             return False
         mean_return = np.mean(eval_returns[-10:])
         done = mean_return >= threshold
