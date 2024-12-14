@@ -1,3 +1,5 @@
+import copy
+
 import embodied
 import jax
 import jax.numpy as jnp
@@ -20,6 +22,12 @@ class CheckTypesFilter(logging.Filter):
     def filter(self, record):
         return "check_types" not in record.getMessage()
 
+def masked_mean(x, mask):
+    # x: [B,T], mask: [B,T], True or False (True: keep, False: mask out)
+    # mask를 float으로 변환 후 sum 사용
+    mask_f = mask.astype(f32)
+    denom = jnp.sum(mask_f)
+    return jnp.sum(x * mask_f) / jnp.maximum(denom, 1e-8)
 
 logger.addFilter(CheckTypesFilter())
 
@@ -73,51 +81,75 @@ class Agent(nj.Module):
             is_leaf=is_list,
         )
         self.config.jax.jit and embodied.print("Tracing policy function", "yellow")
-        obs = self.preprocess(obs)
+
+        B, T = obs["is_first"].shape
+        mask = (jnp.arange(T)[None, :] < obs["padding_start"][:, None])  # (B,T) bool
+
+        obs = self.preprocess(copy.deepcopy(obs))
         (prev_state, prev_action), task_state, expl_state = carry
-        embed = self.wm.encoder(obs, batchdims=1)
-        carry = self.wm.rssm.obs_step(prev_state, prev_action, embed, obs["is_first"])
-        task_act, task_state = self.task_behavior.policy(carry, task_state)
-        expl_act, expl_state = self.expl_behavior.policy(carry, expl_state)
+        z = self.wm.encoder(obs)   #z화
+
+        h = self.wm.mamba.obs_step(z, obs["action"], mask)
+        h_t = h[:, -1]  # 현재 시점 t의 h
+
+        # task_behavior, expl_behavior에 h_t 전달
+        # behavior.policy는 (h_t, state) → action, new_state
+        # 여기서 h_t는 single timestep의 batch 정보( (B,h_dim) )
+        task_act, task_state = self.task_behavior.policy(h_t, task_state)
+        expl_act, expl_state = self.expl_behavior.policy(h_t, expl_state)
+
         act = {"eval": task_act, "explore": expl_act, "train": task_act}[mode]
-        carry = ((carry, act), task_state, expl_state)
+        # action space에 따라 discrete인 경우 argmax 처리
         act = {
             k: jnp.argmax(act[k], -1).astype(jnp.int32) if s.discrete else act[k]
             for k, s in self.act_space.items()
         }
+
+        # carry에는 h를 물고 다니지 않아도 되므로 behavior state만 넣음
+        carry = ({}, task_state, expl_state)
         return act, carry
+
 
     def train(self, data, carry, train_wm=True, train_ac=True, ignore_inputs=()):
         self.config.jax.jit and embodied.print("Tracing train function", "yellow")
-        data = self.preprocess(data)
-        for key in ignore_inputs:
-            data[key] = jnp.zeros_like(data[key])
+
+        # 마찬가지로 mask 생성
+        B, T = data["is_first"].shape
+        mask = (jnp.arange(T)[None, :] < data["padding_start"][:, None])  # (B,T) bool
+
+        data = self.preprocess(copy.deepcopy(data))
+
         metrics = {}
         if train_wm:
-            outs, carry, mets = self.wm.train(data, carry, ignore_inputs)
+            outs, new_carry, mets = self.wm.train(data, {}, ignore_inputs, mask=mask)
             metrics.update(mets)
         else:
-            _, outs, carry = self.wm.observe(data, carry)
+            _, outs, _ = self.wm.observe(data, {}, mask=mask)
         if train_ac:
             context = {**data, **outs}
-            start = tree_map(lambda x: x.reshape((-1, *x.shape[2:])), context)
-            _, mets = self.task_behavior.train(self.wm.imagine, start, context)
+            _, mets = self.task_behavior.train(self.wm.imagine, context, context, mask=mask)
             metrics.update(mets)
             if self.config.expl_behavior != "None":
-                _, mets = self.expl_behavior.train(self.wm.imagine, start, context)
-                metrics.update({"expl_" + key: value for key, value in mets.items()})
+                _, mets = self.expl_behavior.train(self.wm.imagine, context, context)
+                metrics.update({"expl_" + k: v for k, v in mets.items()})
+
         outs = {}
-        return outs, carry, metrics
+        return outs, {}, metrics
 
     def report(self, data):
-        self.config.jax.jit and embodied.print("Tracing report function", "yellow")
-        data = self.preprocess(data)
+        # report 시에도 전체 시퀀스 입력
+
+        B, T = data["is_first"].shape
+        mask = (jnp.arange(T)[None, :] < data["padding_start"][:, None])
+
+        data = self.preprocess(copy.deepcopy(data))
+        # mask 생성
         report = {}
-        report.update(self.wm.report(data))
-        mets = self.task_behavior.report(data)
+        report.update(self.wm.report(data, mask=mask))
+        mets = self.task_behavior.report(data, mask=mask)
         report.update({f"task_{k}": v for k, v in mets.items()})
         if self.expl_behavior is not self.task_behavior:
-            mets = self.expl_behavior.report(data)
+            mets = self.expl_behavior.report(data, mask=mask)
             report.update({f"expl_{k}": v for k, v in mets.items()})
         return report
 
@@ -145,10 +177,7 @@ class WorldModel(nj.Module):
         # TODO: maybe updating the observation space of the task env
         # to take also output one hot task label? we hardcode the number of task.
         self.encoder = nets.MultiEncoder(obs_space, **config.encoder, name="enc")
-        if config.rssm_type == "rssm":
-            self.rssm = nets.RSSM(**config.rssm, name="rssm")
-        else:
-            raise NotImplementedError(config.rssm_type)
+        self.mamba = nets.MambaSSM(**config.mamba, name="mamba")
         self.heads = {
             "decoder": nets.MultiDecoder(obs_space, **config.decoder, name="dec"),
             "reward": nets.MLP((), **config.reward_head, name="rew"),
@@ -165,105 +194,167 @@ class WorldModel(nj.Module):
 
     def initial(self, batch_size):
         bs = batch_size
-        latent = self.rssm.initial(bs)
+        latent = self.mamba.initial(bs)
         action = {
             k: jnp.zeros((bs, *v.shape, int(v.high)) if v.discrete else (bs, *v.shape))
             for k, v in self.act_space.items()
         }
         return latent, action
 
-    def train(self, data, carry, ignore_inputs=()):
-        modules = [self.encoder, self.rssm, *self.heads.values()]
+    def train(self, data, carry, ignore_inputs=(), mask=None):
+        modules = [self.encoder, self.mamba, *self.heads.values()]
         mets, (outs, carry, metrics) = self.opt(
-            modules, self.loss, data, carry, ignore_inputs, has_aux=True
+            modules, self.loss, data, carry, ignore_inputs, mask, has_aux=True
         )
         metrics.update(mets)
         return outs, carry, metrics
 
-    def loss(self, data, carry, ignore_inputs=()):
+    def loss(self, data, carry, ignore_inputs=(), mask=None):
+        """
+        data: dict of [B,T,...]
+        mask: [B,T], True/False
+        """
         metrics = {}
-        states, feats, carry = self.observe(data, carry)
+        # states, feats, carry: observe 결과
+        states, feats, carry = self.observe(data, carry, mask=mask)
 
+        # decoder, reward, cont 예측
         dists = {}
         for name, head in self.heads.items():
             out = head(feats if name in self.config.grad_heads else sg(feats))
             out = out if isinstance(out, dict) else {name: out}
             dists.update(out)
         dists = {k: v for k, v in dists.items() if k not in ignore_inputs}
-        losses, stats = self.rssm.loss(states, **self.config.rssm_loss)
 
+        post_logit = states["logit"]
+        kl_losses, kl_metrics = self.mamba.loss(states, post_logit, **self.config.mamba_loss, mask=mask)
+
+        losses = {}
         for key, dist in dists.items():
-            try:
-                loss = -dist.log_prob(data[key].astype(f32))
-            except Exception as e:
-                raise Exception(f"Error in {name} loss:\n\n{e}.") from e
-            assert loss.shape == feats["embed"].shape[:2], (key, loss.shape)
-            losses[key] = loss
+            target = data[key].astype(f32)
+            l = -dist.log_prob(target)  # [B,T]
+            losses[key] = l
 
+        losses.update(kl_losses)  # {"dyn":..., "rep":...}
+
+        # scaling
+        scaled_losses = {}
+        for k, v in losses.items():
+            # v: [B,T]
+            # 마스크 적용 후 평균
+            mean_loss = masked_mean(v, mask) * self.scales.get(k, 1.0)
+            scaled_losses[k] = mean_loss
+
+        model_loss = sum(scaled_losses.values())
+
+        # metrics
+        metrics.update(kl_metrics)
+        # 각 디코더 출력의 entropy, accuracy 등
         for key, dist in dists.items():
             if hasattr(dist, "entropy"):
-                metrics[f"{key}_head_entropy"] = dist.entropy().mean()
-            if isinstance(dist, tfd.Categorical):
-                accuracy = (dist.mode() == data[key]).astype(f32)
-                metrics[f"{key}_head_accuracy"] = accuracy.mean()
+                ent = dist.entropy()  # [B,T]
+                metrics[f"{key}_head_entropy"] = masked_mean(ent, mask)
+            if isinstance(dist, tfd.Categorical) and data[key].dtype in (jnp.int32, jnp.int64):
+                # discrete accuracy
+                mode = dist.mode() # [B,T]
+                acc = (mode == data[key]).astype(f32)
+                metrics[f"{key}_head_accuracy"] = masked_mean(acc, mask)
 
-        scaled = {k: v.mean() * self.scales[k] for k, v in losses.items()}
-        model_loss = sum(scaled.values())
-        assert model_loss.shape == ()
-        out.update({f"{k}_loss": v for k, v in losses.items()})
-        metrics.update(self._metrics(data, dists, states, stats, losses, model_loss))
+        # loss 별 통계
+        for k, v in losses.items():
+            metrics[f"{k}_loss_mean"] = masked_mean(v, mask)
+            metrics[f"{k}_loss_std"] = jnp.sqrt(masked_mean((v - masked_mean(v, mask))**2, mask))
+
+        metrics["model_loss"] = model_loss
+
+        # reward stats
+        if "reward" in dists:
+            metrics["reward_max_data"] = jnp.abs(data["reward"][mask]).max()
+            metrics["reward_max_pred"] = jnp.abs(dists["reward"].mean()[mask]).max()
+
+
         return model_loss, (feats, carry, metrics)
 
-    def observe(self, data, carry):
+    def observe(self, data, carry, mask=None):
         embed = self.encoder(data)
         prev_state, prev_action = carry
         prev_acts = {
             k: jnp.concatenate([prev_action[k][:, None], data[k][:, :-1]], 1)
             for k in self.act_space
         }
-        states = self.rssm.observe(prev_state, prev_acts, embed, data["is_first"])
+        states = self.mamaba.observe(prev_state, prev_acts, embed, data["is_first"], mask)
         new_state = {k: v[:, -1] for k, v in states.items()}
         new_action = {k: data[k][:, -1] for k in self.act_space}
         carry = (new_state, new_action)
         outs = {**states, "embed": embed}
         return states, outs, carry
 
-    def imagine(self, policy, start, horizon, carry=None):
+    def imagine(self, policy, data, horizon, carry=None):
         carry = carry or {}
-        state_keys = list(self.rssm.initial(1).keys())
-        state = {k: v for k, v in start.items() if k in state_keys}
-        action, carry = policy(state, carry)
-        keys = list(state.keys()) + list(action.keys()) + list(carry.keys())
-        assert len(set(keys)) == len(keys), ("Colliding keys", keys)
+        state_keys = list(self.mamba.initial(1).keys())
 
-        def step(prev, _):
-            state, action, carry = prev
-            state = self.rssm.img_step(state, action)
-            action, carry = policy(state, carry)
-            return state, action, carry
+        # 기존에는 data가 start 시점의 값만 가졌다면,
+        # 이제 data는 이전 모든 시점 t까지의 obs, action, state 등을 축적한 상태로 전달된다.
+        # 따라서, 현재 time 길이를 파악하고 마지막 state를 가져올 수 있다.
 
-        states, actions, carries = jaxutils.scan(
-            step, jnp.arange(horizon), (state, action, carry), self.config.imag_unroll
+        length = data["is_terminal"].shape[0]  # 현재까지 축적된 시점의 길이
+        # 마지막 시점의 state를 추출
+        state = {k: data[k][length - 1] for k in state_keys}
+
+        action, carry = policy(data, carry)
+
+        def step(carry, _):
+            (state, carry_, data_) = carry
+
+            new_state = self.mamba.img_step(state, action)
+
+            # 예측된 다음 state와 바로 전 단계에서 선택한 action을 data에 축적
+            # data_: time dimension이 [T, ...] 형태라 가정, 여기에 새 시점 [T+1, ...]을 concatenate
+
+            new_states_dict = {k: new_state[k][None] for k in state_keys}
+            new_actions_dict = {k: action[k][None] for k in action}
+
+            # data_에 새로운 state, action 추가
+            data_ = {k: jnp.concatenate([data_[k], new_states_dict[k]], axis=0) if k in new_states_dict else data_[k]
+                     for k in data_}
+            data_ = {k: jnp.concatenate([data_[k], new_actions_dict[k]], axis=0) if k in new_actions_dict else data_[k]
+                     for k in data_}
+
+            # 업데이트된 data_를 바탕으로 다시 policy 호출
+            new_action, carry_ = policy(data_, carry_)
+
+            return (new_state, carry_, data_), (new_state, new_action)
+
+        # horizon 단계 동안 반복
+        (state, carry, data), traj = jaxutils.scan(
+            step,
+            inputs=jnp.arange(horizon),
+            start=(state, carry, data),
+            unroll=self.config.imag_unroll,
         )
-        states, actions, carries = tree_map(
-            lambda traj, first: jnp.concatenate([first[None], traj], 0),
-            (states, actions, carries),
-            (state, action, carry),
-        )
-        traj = {**states, **actions, **carries}
+
+        # traj에는 각 스텝별 (new_state, new_action)들이 들어있으며
+        # data는 이제 전체 (원래 data + horizon 동안 예측한 스텝)의 정보를 가지게 된다.
+
+        # cont와 weight 계산
         if self.config.imag_cont == "mode":
-            cont = self.heads["cont"](traj).mode()
+            cont = self.heads["cont"](data).mode()
         elif self.config.imag_cont == "mean":
-            cont = self.heads["cont"](traj).mean()
+            cont = self.heads["cont"](data).mean()
         else:
             raise NotImplementedError(self.config.imag_cont)
-        first_cont = (1.0 - start["is_terminal"]).astype(f32)
-        traj["cont"] = jnp.concatenate([first_cont[None], cont[1:]], 0)
-        discount = 1 - 1 / self.config.horizon
-        traj["weight"] = jnp.cumprod(discount * traj["cont"], 0) / discount
-        return traj
 
-    def report(self, data):
+        first_cont = (1.0 - data["is_terminal"][0]).astype(f32)
+        cont = jnp.concatenate([first_cont[None], cont[1:]], 0)
+        data["cont"] = cont
+
+        discount = 1 - 1 / self.config.horizon
+        data["weight"] = jnp.cumprod(discount * data["cont"], 0) / discount
+
+        return data
+
+
+    def report(self, data):     #구현 x
         state = self.initial(len(data["is_first"]))
         report = {}
         report.update(self.loss(data, state)[-1][-1])
@@ -274,7 +365,7 @@ class WorldModel(nj.Module):
         start = {k: v[:, -1] for k, v in states.items()}
         recon = self.heads["decoder"](states)
         prev_acts = {k: data[k][:6, 5 - 1 : -1] for k in self.act_space}
-        openl = self.heads["decoder"](self.rssm.imagine(start, prev_acts))
+        openl = self.heads["decoder"](self.mamba.imagine(start, prev_acts))
         for key in self.heads["decoder"].cnn_keys:
             truth = data[key][:6].astype(f32)
             model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
@@ -340,13 +431,13 @@ class ImagActorCritic(nj.Module):
             action = {k: v.mode() for k, v in dist.items()}
         return action, carry
 
-    def train(self, imagine, start, context):
-        def loss(start):
-            traj = imagine(self.policy, start, self.config.imag_horizon)
+    def train(self, imagine, data, context):
+        def loss(data):
+            traj = imagine(self.policy, data, self.config.imag_horizon)
             loss, metrics = self.loss(traj)
             return loss, (traj, metrics)
 
-        mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
+        mets, (traj, metrics) = self.opt(self.actor, loss, data, has_aux=True)
         metrics.update(mets)
         for key, critic in self.critics.items():
             mets = critic.train(traj, self.actor)
@@ -392,7 +483,7 @@ class ImagActorCritic(nj.Module):
             act = jnp.argmax(traj[key], -1) if space.discrete else traj[key]
             metrics.update(jaxutils.tensorstats(act.astype(f32), f"{key}_action"))
             rand = (ent[key] - policy[key].minent) / (
-                policy[key].maxent - policy[key].minent
+                    policy[key].maxent - policy[key].minent
             )
             rand = rand.mean(range(2, len(rand.shape)))
             metrics.update(jaxutils.tensorstats(rand, f"{key}_policy_randomness"))
@@ -447,7 +538,7 @@ class VFunction(nj.Module):
     def score(self, traj, actor=None, slow=False):
         rew = self.rewfn(traj)
         assert (
-            len(rew) == len(list(traj.values())[0]) - 1
+                len(rew) == len(list(traj.values())[0]) - 1
         ), "should provide rewards for all but last action"
         discount = 1 - 1 / self.config.horizon
         disc = traj["cont"][1:] * discount

@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tensorflow_probability.substrates import jax as tfp
-
 f32 = jnp.float32
 tfd = tfp.distributions
 tree_map = jax.tree_util.tree_map
@@ -15,127 +14,263 @@ from . import ninjax as nj
 
 cast = jaxutils.cast_to_compute
 
+# ==========================
+# Mamba Model Implementation
+# ==========================
+from dataclasses import dataclass
+from functools import partial
+import math
+import jax.nn.initializers as init
+from flax import linen as nn
 
-class RSSM(nj.Module):
+
+def masked_mean(x, mask):
+    # x: [B,T], mask: [B,T], True or False (True: keep, False: mask out)
+    mask_f = mask.astype(f32)
+    denom = jnp.sum(mask_f)
+    return jnp.sum(x * mask_f) / jnp.maximum(denom, 1e-8)
+
+@dataclass
+class MambaArgs:
+    d_model: int
+    n_layer: int
+    d_state: int = 16
+    expand: int = 2
+    dt_rank: str = 'auto'
+    d_conv: int = 4
+    conv_bias: bool = True
+    bias: bool = False
+
+    def __post_init__(self):
+        if self.dt_rank == 'auto':
+            self.dt_rank = math.ceil(self.d_model / 16)
+
+class RMSNorm(nn.Module):
+    d_model: int
+    eps: float = 1e-5
+    @nn.compact
+    def __call__(self, x):
+        weight = self.param('weight', init.ones, (self.d_model,))
+        normed = x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + self.eps)
+        return normed * weight
+
+class MambaBlock(nn.Module):
+    args: MambaArgs
+    def setup(self):
+        self.in_proj = nn.Dense(features=self.args.d_model*self.args.expand*2,
+                                kernel_init=init.normal(),
+                                use_bias=self.args.bias)
+        self.conv1d = nn.Conv(features=self.args.d_model*self.args.expand,
+                              kernel_size=[self.args.d_conv],
+                              feature_group_count=self.args.d_model*self.args.expand,
+                              padding='VALID',
+                              use_bias=self.args.conv_bias,
+                              kernel_init=init.normal())
+        self.x_proj = nn.Dense(self.args.dt_rank + self.args.d_state * 2, use_bias=False)
+        self.dt_proj = nn.Dense(self.args.d_model*self.args.expand, use_bias=True)
+        d_in = self.args.d_model*self.args.expand
+        self.A_log = self.param('A_log', lambda rng, shape: jnp.log(jnp.tile(jnp.arange(1, self.args.d_state+1), (d_in,1))), (d_in,self.args.d_state))
+        self.D = self.param('D', init.ones, (d_in,))
+        self.out_proj = nn.Dense(self.args.d_model, kernel_init=init.normal(), use_bias=self.args.bias)
+
+    def ssm(self, x):
+        b, l, d_in = x.shape
+        A = -jnp.exp(self.A_log)
+        D = self.D
+        x_dbl = self.x_proj(x)
+        delta, B, C = jnp.split(x_dbl, [self.args.dt_rank, self.args.dt_rank+self.args.d_state], axis=-1)
+        delta = jax.nn.softplus(self.dt_proj(delta))
+
+        # 아래 구현은 시퀀스 길이 l에 대해 O(l)로 순차적이나 jax jit로 벡터화 가능
+        n = self.args.d_state
+        # 타일링
+        B_tiled = jnp.expand_dims(B,2) # [B,T,1,d_state]
+        C_tiled = jnp.expand_dims(C,2) # [B,T,1,d_state]
+        B_tiled = jnp.repeat(B_tiled, d_in, axis=-2)
+        C_tiled = jnp.repeat(C_tiled, d_in, axis=-2)
+
+        u = x
+        deltaA = jnp.exp(jnp.einsum('btd,dn->btdn', delta, A))
+        # 상태 추적
+        x_state = jnp.zeros((b, d_in, n))
+        ys = []
+        for i in range(l):
+            x_state = deltaA[:, i] * x_state + (delta[:, i, :, None] * (B_tiled[:, i] * u[:, i, :, None]))
+            y_t = jnp.einsum('bdn,bdn->bd', x_state, C_tiled[:,i])
+            y_t = y_t + u[:, i, :]*D
+            ys.append(y_t)
+        y = jnp.stack(ys, axis=1)
+        return y
+
+    @nn.compact
+    def __call__(self, x):
+        B,L,D = x.shape
+        pad_len = self.args.d_conv - 1
+        x_padded = jnp.pad(x, ((0,0),(pad_len,0),(0,0)))
+        x_and_res = self.in_proj(x)
+        d_in = self.args.d_model*self.args.expand
+        x_, res = jnp.split(x_and_res, [d_in], axis=-1)
+        x_conv = self.conv1d(x_padded)
+        x_conv = x_conv[:,:L,:]
+        x_conv = jax.nn.silu(x_conv)
+        y = self.ssm(x_conv)
+        y = y * jax.nn.silu(res)
+        return self.out_proj(y)
+
+class ResidualBlock(nn.Module):
+    args: MambaArgs
+    def setup(self):
+        self.mixer = MambaBlock(self.args)
+        self.norm = RMSNorm(self.args.d_model)
+    def __call__(self, x):
+        return self.mixer(self.norm(x)) + x
+
+class MambaModel(nn.Module):
+    args: MambaArgs
+    def setup(self):
+        self.layers = [ResidualBlock(self.args) for _ in range(self.args.n_layer)]
+        self.norm_f = RMSNorm(self.args.d_model)
+    def __call__(self, inputs):
+        x = inputs
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm_f(x)
+        return x
+
+# ==========================
+# MambaSSM for World Model (Replacing RSSM)
+# ==========================
+class MambaSSM(nj.Module):
     def __init__(
-        self,
-        deter=1024,
-        stoch=32,
-        classes=32,
-        unroll=False,
-        unimix=0.01,
-        bottleneck=-1,
-        **kw,
+            self,
+            d_model=1024,
+            n_layer=4,
+            d_state=16,
+            expand=2,
+            dt_rank='auto',
+            d_conv=4,
+            conv_bias=True,
+            bias=False,
+            stoch=32,
+            classes=32,
+            unimix=0.01,
+            **kw,
     ):
-        self._deter = deter
         self._stoch = stoch
         self._classes = classes
-        self._unroll = unroll
         self._unimix = unimix
-        self._bottleneck = bottleneck
-        self._kw = kw
+        self.args = MambaArgs(
+            d_model=d_model,
+            n_layer=n_layer,
+            d_state=d_state,
+            expand=expand,
+            dt_rank=dt_rank,
+            d_conv=d_conv,
+            conv_bias=conv_bias,
+            bias=bias
+        )
 
     def initial(self, batch_size):
-        return cast(
-            dict(
-                deter=jnp.zeros([batch_size, self._deter], f32),
-                stoch=jnp.zeros([batch_size, self._stoch, self._classes], f32),
-                logit=jnp.zeros([batch_size, self._stoch, self._classes], f32),
-            )
-        )
+        # 초기 h는 단순히 zeros
+        return cast(dict(deter=jnp.zeros([batch_size, self.args.d_model], f32)))
 
-    def observe(self, state, action, embed, reset):
-        return jaxutils.scan(
-            lambda state, inputs: self.obs_step(state, *inputs),
-            (action, embed, reset),
-            state,
-            self._unroll,
-            axis=1,
-        )
+    def observe(self, prev_state, actions, embed, is_first, mask=None):
+        """
+        observe 단계:
+        q(z_t|x_t)는 외부 encoder로부터 얻어서 embed=z_t로 전달받는다고 가정.
+        z_t: [B,T,stoch,classes]
+        actions: [B,T, ...]
+        is_first: [B,T]
+        """
+        B,T = embed.shape[:2]
+        z_shp = embed.shape
+        assert z_shp[2:] == (self._stoch,self._classes), z_shp
+        z_input = embed.reshape(B,T,self._stoch*self._classes)
+        a_flat = jaxutils.concat_dict(actions) # [B,T,action_dim]
 
-    def imagine(self, state, action):
-        return jaxutils.scan(
-            lambda state, inputs: self.img_step(state, *inputs),
-            (action,),
-            state,
-            self._unroll,
-            axis=1,
-        )
+        # Mamba: h_t = f_Mamba(z_{1:t-1}, a_{1:t-1})
+        z_in = z_input[:,:-1] if T>1 else jnp.zeros((B,0,self._stoch*self._classes), f32)
+        a_in = a_flat[:,:-1] if T>1 else jnp.zeros((B,0,a_flat.shape[-1]), f32)
+        mamba_in = jnp.concatenate([z_in, a_in], axis=-1) # [B,T-1,Zdim+Adim]
 
-    def obs_step(self, state, action, embed, reset):
-        action = cast(jaxutils.concat_dict(action))
-        state = jaxutils.reset(state, reset)
-        action = jaxutils.reset(action, reset)
-        deter = self._gru(state, action)
-        x = jnp.concatenate([deter, embed], -1)
-        x = self.get("obs_out", Linear, **self._kw)(x)
-        logit = self._logit("repr_logit", x)
-        stoch = self._dist(logit).sample(seed=nj.rng())
-        state = cast({"deter": deter, "stoch": stoch, "logit": logit})
-        return state
+        # projection to d_model
+        proj = self.get("mamba_in_proj", Linear, self.args.d_model)(mamba_in)
+        h_seq = self.get("mamba_core", MambaModel, self.args)(proj) # [B,T-1,d_model]
 
-    def img_step(self, state, action):
-        action = cast(jaxutils.concat_dict(action))
-        deter = self._gru(state, action)
-        logit = self._prior(deter)
-        stoch = self._dist(logit).sample(seed=nj.rng())
-        state = cast({"deter": deter, "stoch": stoch, "logit": logit})
-        return state
+        h0 = jnp.zeros((B,1,self.args.d_model), f32)
+        h_full = jnp.concatenate([h0,h_seq], axis=1) # [B,T,d_model]
+        h_full = jaxutils.reset(h_full, is_first)
 
-    def loss(self, obs_states, free=1.0):
-        metrics = {}
-        prior = self._prior(obs_states["deter"])
-        post = obs_states["logit"]
-        dyn = self._dist(sg(post)).kl_divergence(self._dist(prior))
-        rep = self._dist(post).kl_divergence(self._dist(sg(prior)))
-        if free:
-            dyn = jnp.maximum(dyn, free)
-            rep = jnp.maximum(rep, free)
-        losses = {"dyn": dyn, "rep": rep}
-        metrics["prior_ent"] = self._dist(prior).entropy()
-        metrics["post_ent"] = self._dist(post).entropy()
-        return losses, metrics
+        states = dict(deter=h_full)
+        return states
 
-    def _prior(self, deter):
-        return self._logit("prior_logit", deter)
+    def imagine(self, state, actions):
+        """
+        imagination 단계:
+        여기서도 동일하게 z를 prior로 sample하여 주입할 수 있음.
+        만약 z가 아직 없으면 dummy z를 사용 후 상위 레벨에서 iterative하게 z sample.
+        """
+        B = actions[list(actions.keys())[0]].shape[0]
+        T = actions[list(actions.keys())[0]].shape[1]+1
+        # 여기서는 dummy z 사용 (실제론 prior에서 샘플한 z를 step by step반영)
+        z_dummy = jnp.zeros((B,T,self._stoch*self._classes), f32)
+        a_flat = jaxutils.concat_dict(actions) # [B,T-1,adim]
 
-    def _gru(self, state, action):
-        action /= sg(jnp.maximum(1, jnp.abs(action)))
-        batch_shape = state["deter"].shape[:-1]
-        x = jnp.concatenate(
-            [
-                state["stoch"].reshape((*batch_shape, -1)),
-                cast(action).reshape((*batch_shape, -1)),
-            ],
-            -1,
-        )
-        x = self.get("img_in", Linear, **self._kw)(x)
-        x = jnp.concatenate([state["deter"], x], -1)
-        if self._bottleneck > 0:
-            kw = {**self._kw, "units": self._bottleneck}
-            x = self.get("bottleneck", Linear, **kw)(x)
-        kw = {**self._kw, "act": "none", "units": 3 * self._deter}
-        x = self.get("gru", Linear, **kw)(x)
-        reset, cand, update = jnp.split(x, 3, -1)
-        reset = jax.nn.sigmoid(reset)
-        cand = jnp.tanh(reset * cand)
-        update = jax.nn.sigmoid(update - 1)
-        deter = update * cand + (1 - update) * state["deter"]
-        return deter
+        z_in = z_dummy[:,:-1]
+        a_in = a_flat
+        mamba_in = jnp.concatenate([z_in, a_in], axis=-1)
+        proj = self.get("mamba_imagine_in_proj", Linear, self.args.d_model)(mamba_in)
+        h_seq = self.get("mamba_imagine_core", MambaModel, self.args)(proj)
+        h0 = jnp.zeros((B,1,self.args.d_model), f32)
+        h_full = jnp.concatenate([h0,h_seq], axis=1)
+        states = dict(deter=h_full)
+        return states
 
-    def _logit(self, name, x):
-        x = self.get(name, Linear, self._stoch * self._classes)(x)
-        logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
+    def _prior(self, h):
+        # p(z_t|h_t) logit
+        x = self.get("prior_logit", Linear, self._stoch*self._classes)(h)
+        logit = x.reshape(x.shape[:-1]+(self._stoch,self._classes))
         if self._unimix:
             probs = jax.nn.softmax(logit, -1)
             uniform = jnp.ones_like(probs) / probs.shape[-1]
-            probs = (1 - self._unimix) * probs + self._unimix * uniform
+            probs = (1 - self._unimix)*probs + self._unimix*uniform
             logit = jnp.log(probs)
         return logit
 
     def _dist(self, logit):
         return tfd.Independent(jaxutils.OneHotDist(logit.astype(f32)), 1)
 
+    def loss(self, states, post_logit, free=1.0, mask=None):
+        """
+        states: {"deter": [B,T,d_model]}
+        post_logit: q(z_t|x_t)의 logit [B,T,stoch,classes]
+        mask: [B,T] 학습에 포함할 timestep에 True, 제외할 timestep에 False
+        """
+        metrics = {}
+        prior = self._prior(states["deter"])  # [B,T,stoch,classes]
+        post = post_logit  # q(z_t|x_t) logit
+
+        # KL 계산
+        dyn = self._dist(sg(post)).kl_divergence(self._dist(prior))  # [B,T]
+        rep = self._dist(post).kl_divergence(self._dist(sg(prior)))  # [B,T]
+
+        if free:
+            dyn = jnp.maximum(dyn, free)
+            rep = jnp.maximum(rep, free)
+
+        # mask 적용
+        dyn_loss = masked_mean(dyn, mask)
+        rep_loss = masked_mean(rep, mask)
+
+        # prior/post entropy
+        prior_ent = self._dist(prior).entropy()  # [B,T]
+        post_ent = self._dist(post).entropy()    # [B,T]
+
+        metrics["prior_ent"] = masked_mean(prior_ent, mask)
+        metrics["post_ent"] = masked_mean(post_ent, mask)
+
+        losses = {"dyn": dyn, "rep": rep}
+        return losses, metrics
 
 class MultiEncoder(nj.Module):
     def __init__(
